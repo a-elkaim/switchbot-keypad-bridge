@@ -327,7 +327,6 @@ void test_predecessor_replay_consumes_handoff() {
 void test_rejected_predecessor_attempts_close_handoff() {
   // The first predecessor non-poll frame consumes the one-shot regardless of
   // whether it is admissible. This prevents unlimited probing without time.
-  assert_rejected_retired_attempt_closes_handoff(LOCK, 0x26);
   assert_rejected_retired_attempt_closes_handoff(UNKNOWN, 0x27);
   assert_rejected_retired_attempt_closes_handoff(DOORBELL, 0x28);
   assert_rejected_retired_attempt_closes_handoff(UNKNOWN_METHOD_UNLOCK, 0x29);
@@ -346,13 +345,68 @@ void test_rejected_active_predecessor_attempt_closes_handoff() {
 
   queue_iv(current_iv);
   assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
-  assert(session.process_frame(encrypted_frame(predecessor_iv, LOCK)) ==
+  assert(session.process_frame(encrypted_frame(predecessor_iv, DOORBELL)) ==
          LockSession::Action::NONE);
   assert(session.process_frame(
              encrypted_frame(predecessor_iv, FINGERPRINT_UNLOCK)) ==
          LockSession::Action::NONE);
   assert(session.process_frame(encrypted_frame(current_iv, STATE_POLL)) ==
          LockSession::Action::COMMAND);
+}
+
+void test_late_lock_is_admitted_once() {
+  {
+    // Ordering seen on a Keypad Vision with Fast Unlock: the lock button is
+    // pressed right after an IV request, before any frame commits pending_.
+    LockSession session;
+    session.set_aes_key(TEST_KEY);
+    const auto predecessor_iv = make_iv(0x60);
+    const auto pending_iv = make_iv(0x61);
+    queue_iv(predecessor_iv);
+    assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+    assert(session.process_frame(encrypted_frame(predecessor_iv, STATE_POLL)) ==
+           LockSession::Action::COMMAND);
+    queue_iv(pending_iv);
+    assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+
+    assert(session.process_frame(encrypted_frame(predecessor_iv, LOCK)) ==
+           LockSession::Action::COMMAND);
+    assert(session.command().type == CommandType::LOCK);
+    assert_response_uses_iv(session, predecessor_iv);
+
+    // One-shot: a second late action under the predecessor is refused.
+    assert(session.process_frame(
+               encrypted_frame(predecessor_iv, FINGERPRINT_UNLOCK)) ==
+           LockSession::Action::NONE);
+    assert(session.process_frame(encrypted_frame(pending_iv, STATE_POLL)) ==
+           LockSession::Action::COMMAND);
+  }
+
+  {
+    // The other ordering: a poll commits the new IV first, then the lock
+    // encrypted with the predecessor arrives.
+    LockSession session;
+    session.set_aes_key(TEST_KEY);
+    const auto predecessor_iv = make_iv(0x62);
+    const auto current_iv = make_iv(0x63);
+    queue_iv(predecessor_iv);
+    assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+    assert(session.process_frame(encrypted_frame(predecessor_iv, STATE_POLL)) ==
+           LockSession::Action::COMMAND);
+    queue_iv(current_iv);
+    assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+    assert(session.process_frame(encrypted_frame(current_iv, STATE_POLL)) ==
+           LockSession::Action::COMMAND);
+
+    const std::string late_lock = encrypted_frame(predecessor_iv, LOCK);
+    assert(session.process_frame(late_lock) == LockSession::Action::COMMAND);
+    assert(session.command().type == CommandType::LOCK);
+    assert_response_uses_iv(session, predecessor_iv);
+    // The predecessor is gone after its one late action.
+    assert(session.process_frame(late_lock) == LockSession::Action::NONE);
+    assert(session.process_frame(encrypted_frame(current_iv, STATE_POLL)) ==
+           LockSession::Action::COMMAND);
+  }
 }
 
 void test_poll_budget_closes_state_only_handoff() {
@@ -689,6 +743,7 @@ int main() {
   test_predecessor_replay_consumes_handoff();
   test_rejected_predecessor_attempts_close_handoff();
   test_rejected_active_predecessor_attempt_closes_handoff();
+  test_late_lock_is_admitted_once();
   test_poll_budget_closes_state_only_handoff();
   test_next_encrypted_frame_closes_retired_handoff();
   test_current_generation_action_closes_retired_handoff();
